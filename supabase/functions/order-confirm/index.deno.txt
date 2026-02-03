@@ -1,0 +1,156 @@
+// @deno-types
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts"
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2"
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+}
+
+serve(async (req) => {
+  // Handle CORS preflight request
+  if (req.method === "OPTIONS") {
+    return new Response(null, {
+      headers: corsHeaders,
+      status: 204,
+    })
+  }
+
+  try {
+    // Create Supabase client
+    const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? ""
+    const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? ""
+    const supabase = createClient(supabaseUrl, supabaseKey)
+
+    // Get user from auth
+    const authHeader = req.headers.get("Authorization")?.split(" ")[1]
+    const {
+      data: { user },
+      error: userError,
+    } = await supabase.auth.getUser(authHeader)
+
+    if (userError || !user) {
+      return new Response(JSON.stringify({ error: "Unauthorized" }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+        status: 401,
+      })
+    }
+
+    // Get current editing order
+    const { data: order, error: orderError } = await supabase
+      .from("orders")
+      .select("id, total_amount")
+      .eq("user_tg_id", user.id)
+      .eq("status", "editing")
+      .single()
+
+    if (orderError) {
+      return new Response(JSON.stringify({ error: "No active order found" }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+        status: 404,
+      })
+    }
+
+    // Update order status to confirmed
+    const { error: updateError } = await supabase
+      .from("orders")
+      .update({
+        status: "confirmed",
+      })
+      .eq("id", order.id)
+
+    if (updateError) throw updateError
+
+    // Send notification to Telegram bot
+    const botToken = Deno.env.get("TELEGRAM_BOT_TOKEN")
+    const adminChatId = Deno.env.get("ADMIN_CHAT_ID")
+
+    if (botToken && adminChatId) {
+      const { data: items } = await supabase
+        .from("order_items")
+        .select(`
+          quantity,
+          unit_price,
+          product:product_id (name)
+        `)
+        .eq("order_id", order.id)
+
+      let message = `🌸 Новый заказ!\n\n`
+      message += `ID заказа: ${order.id}\n`
+      message += `Клиент: ${user.id}\n\n`
+      message += `Товары:\n`
+
+      items?.forEach((item) => {
+        message += `- ${item.product.name} x${item.quantity} = ${item.unit_price * item.quantity} ₽\n`
+      })
+
+      message += `\nИтого: ${order.total_amount} ₽`
+
+      try {
+        await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            chat_id: adminChatId,
+            text: message,
+            parse_mode: "HTML",
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  {
+                    text: "Отметить как оплаченный",
+                    callback_data: `paid:${order.id}`,
+                  },
+                ],
+              ],
+            },
+          }),
+        })
+      } catch (telegramError) {
+        console.error("Error sending Telegram message to admin:", telegramError)
+      }
+
+      // Send message to customer
+      try {
+        await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            chat_id: user.id,
+            text: `Ваш заказ на сумму ${order.total_amount} ₽ подтвержден!`,
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  {
+                    text: "Оплатить",
+                    callback_data: `pay:${order.id}`,
+                  },
+                  {
+                    text: "Изменить",
+                    callback_data: `edit:${order.id}`,
+                  },
+                ],
+              ],
+            },
+          }),
+        })
+      } catch (telegramError) {
+        console.error("Error sending Telegram message to customer:", telegramError)
+      }
+    }
+
+    return new Response(JSON.stringify({ success: true, order_id: order.id }), {
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+      status: 200,
+    })
+  } catch (error) {
+    return new Response(JSON.stringify({ error: error.message }), {
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+      status: 500,
+    })
+  }
+})

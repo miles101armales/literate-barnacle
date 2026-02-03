@@ -1,0 +1,102 @@
+// @deno-types
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts"
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2"
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+}
+
+serve(async (req) => {
+  // Handle CORS preflight request
+  if (req.method === "OPTIONS") {
+    return new Response(null, {
+      headers: corsHeaders,
+      status: 204,
+    })
+  }
+
+  try {
+    // Get request body
+    const { order_id } = await req.json()
+
+    // Create Supabase client
+    const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? ""
+    const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? ""
+    const supabase = createClient(supabaseUrl, supabaseKey)
+
+    // Get order
+    const { data: order, error: orderError } = await supabase
+      .from("orders")
+      .select("id, user_tg_id, status")
+      .eq("id", order_id)
+      .single()
+
+    if (orderError) {
+      return new Response(JSON.stringify({ error: "Order not found" }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+        status: 404,
+      })
+    }
+
+    // Update order status to paid
+    const { error: updateError } = await supabase
+      .from("orders")
+      .update({
+        status: "paid",
+      })
+      .eq("id", order.id)
+
+    if (updateError) throw updateError
+
+    // Send notification to Telegram bot
+    const botToken = Deno.env.get("TELEGRAM_BOT_TOKEN")
+
+    if (botToken) {
+      // Notify admin
+      const adminChatId = Deno.env.get("ADMIN_CHAT_ID")
+      if (adminChatId) {
+        try {
+          await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              chat_id: adminChatId,
+              text: `✅ Заказ ${order.id} оплачен!`,
+            }),
+          })
+        } catch (telegramError) {
+          console.error("Failed to send Telegram message to admin:", telegramError)
+        }
+      }
+
+      // Notify customer
+      try {
+        await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            chat_id: order.user_tg_id,
+            text: `✅ Ваш заказ оплачен! Мы свяжемся с вами для уточнения деталей доставки.`,
+          }),
+        })
+      } catch (telegramError) {
+        console.error("Failed to send Telegram message to customer:", telegramError)
+      }
+    }
+
+    return new Response(JSON.stringify({ success: true }), {
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+      status: 200,
+    })
+  } catch (error) {
+    return new Response(JSON.stringify({ error: error.message }), {
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+      status: 500,
+    })
+  }
+})

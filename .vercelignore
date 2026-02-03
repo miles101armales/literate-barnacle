@@ -1,0 +1,2 @@
+# Игнорируем директорию supabase/functions при деплое на Vercel
+supabase/functions/
